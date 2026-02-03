@@ -25,21 +25,6 @@ class ChannelBot:
     def __init__(self):
         self.application = None
     
-    # Remove start method since you don't want it
-    # async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #     """Send a welcome message when /start is issued."""
-    #     user = update.effective_user
-    #     await update.message.reply_text(
-    #         f"Hi {user.first_name}! I'm your Channel Management Bot.\n\n"
-    #         "Available commands:\n"
-    #         "/add <channel_id> - Add a channel as post channel\n"
-    #         "/main <channel_id> - Set main channel\n"
-    #         "/approve <channel_id> - Approve all pending join requests\n"
-    #         "/list - List all channels\n"
-    #         "/remove <channel_id> - Remove a channel\n"
-    #         "/help - Show help message"
-    #     )
-    
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help message."""
         help_text = """
@@ -196,7 +181,7 @@ class ChannelBot:
             logger.error(f"Error getting join requests: {e}")
             return []
     
-    async def approve_join_request(self, bot: Bot, channel_id: str, user_id: int):
+    async def approve_single_request(self, bot: Bot, channel_id: str, user_id: int):
         """Approve a single join request."""
         try:
             await bot.approve_chat_join_request(
@@ -267,7 +252,7 @@ class ChannelBot:
                     progress = f"Processing {i}/{total_requests}\nApproved: {approved_count}"
                     await status_msg.edit_text(f"⏳ {progress}")
                 
-                success = await self.approve_join_request(bot, channel_id, user.id)
+                success = await self.approve_single_request(bot, channel_id, user.id)
                 
                 if success:
                     approved_count += 1
@@ -325,7 +310,7 @@ class ChannelBot:
                     
                     approved_count = 0
                     for join_request in pending_requests:
-                        success = await self.approve_join_request(bot, channel_id, join_request.user.id)
+                        success = await self.approve_single_request(bot, channel_id, join_request.user.id)
                         if success:
                             approved_count += 1
                         await asyncio.sleep(0.5)
@@ -472,7 +457,7 @@ class ChannelBot:
         # Create Application
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         
-        # Command handlers - REMOVED /start
+        # Command handlers
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("add", self.add_channel))
         self.application.add_handler(CommandHandler("main", self.set_main_channel))
