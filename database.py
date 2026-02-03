@@ -32,6 +32,25 @@ class Database:
     def get_main_channel(self):
         """Get the main channel"""
         return self.channels.find_one({"type": "main", "is_active": True})
+
+
+    def add_join_request(self, channel_id, user_id, request_date=None):
+        """Store join request in database."""
+        self.db.join_requests.insert_one({
+            "channel_id": str(channel_id),
+            "user_id": user_id,
+            "request_date": request_date or datetime.utcnow(),
+            "approved": False,
+            "approved_at": None
+        })
+        
+    def mark_request_approved(self, channel_id, user_id):
+        """Mark join request as approved."""
+        self.db.join_requests.update_one(
+            {"channel_id": str(channel_id), "user_id": user_id},
+            {"$set": {"approved": True, "approved_at": datetime.utcnow()}}
+        )
+    
     
     def get_post_channels(self):
         """Get all post channels"""
