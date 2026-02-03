@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 class ChannelBot:
     def __init__(self):
         self.application = None
+        self.batch_size = 100  # Forward 100 messages at once
+        self.forwarding_queue = []  # Queue for batch forwarding
+        self.is_processing = False
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help message."""
@@ -38,10 +41,10 @@ class ChannelBot:
 • `/remove <channel_id>` - Remove a channel
 • `/stats` - Show bot statistics
 
-**How to get Channel ID:**
-1. Add bot to your channel as admin
-2. Forward a message from channel to @username_to_id_bot
-3. Or use: /getid in the channel
+**Features:**
+• Batch forwarding of 100 messages at once
+• Automatic join request approval
+• MongoDB database for tracking
 
 **Required Bot Permissions:**
 - In Main Channel: Post messages permission
@@ -53,7 +56,6 @@ class ChannelBot:
         """Add a channel as post channel."""
         user_id = update.effective_user.id
         
-        # Check if user is admin
         if user_id not in Config.ADMIN_IDS:
             await update.message.reply_text("❌ You are not authorized to use this command.")
             return
@@ -65,11 +67,9 @@ class ChannelBot:
         channel_id = context.args[0]
         
         try:
-            # Check if bot is admin in the channel
             bot = context.bot
             chat = await bot.get_chat(channel_id)
             
-            # Get bot's status in the channel
             bot_member = await chat.get_member(bot.id)
             if not isinstance(bot_member, ChatMemberAdministrator):
                 await update.message.reply_text(
@@ -78,7 +78,6 @@ class ChannelBot:
                 )
                 return
             
-            # Check if bot has invite permission
             if not bot_member.can_invite_users:
                 await update.message.reply_text(
                     f"⚠️ Warning: Bot doesn't have 'Invite Users' permission in {chat.title}\n"
@@ -86,7 +85,6 @@ class ChannelBot:
                     "Still adding channel..."
                 )
             
-            # Add to database
             db.add_channel(channel_id, "post", chat.title)
             
             await update.message.reply_text(
@@ -116,11 +114,9 @@ class ChannelBot:
         channel_id = context.args[0]
         
         try:
-            # Check if bot is member of the channel
             bot = context.bot
             chat = await bot.get_chat(channel_id)
             
-            # Check if bot can post messages
             bot_member = await chat.get_member(bot.id)
             if not isinstance(bot_member, ChatMemberAdministrator):
                 await update.message.reply_text(
@@ -129,7 +125,6 @@ class ChannelBot:
                 )
                 return
             
-            # Remove any existing main channel
             existing_main = db.get_main_channel()
             if existing_main:
                 db.channels.update_one(
@@ -137,14 +132,13 @@ class ChannelBot:
                     {"$set": {"type": "post"}}
                 )
             
-            # Add new main channel
             db.add_channel(channel_id, "main", chat.title)
             
             await update.message.reply_text(
                 f"✅ Main Channel Set Successfully!\n"
                 f"**Channel:** {chat.title}\n"
                 f"**ID:** `{channel_id}`\n\n"
-                "All posts from this channel will be forwarded to post channels.",
+                "All posts from this channel will be forwarded to post channels in batches of 100.",
                 parse_mode=ParseMode.MARKDOWN
             )
             
@@ -382,8 +376,87 @@ class ChannelBot:
             parse_mode=ParseMode.MARKDOWN
         )
     
+    async def forward_messages_batch(self, context: ContextTypes.DEFAULT_TYPE):
+        """Forward a batch of messages from queue."""
+        if not self.forwarding_queue or self.is_processing:
+            return
+        
+        self.is_processing = True
+        
+        try:
+            # Get a batch of messages to forward (up to batch_size)
+            batch = self.forwarding_queue[:self.batch_size]
+            
+            if not batch:
+                return
+            
+            logger.info(f"Processing batch of {len(batch)} messages")
+            
+            main_channel = db.get_main_channel()
+            post_channels = db.get_post_channels()
+            
+            if not main_channel or not post_channels:
+                self.forwarding_queue = []
+                return
+            
+            # Forward to each post channel in parallel
+            tasks = []
+            for message_data in batch:
+                message_id = message_data['message_id']
+                source_chat_id = message_data['source_chat_id']
+                
+                for channel in post_channels:
+                    # Check if already forwarded
+                    if not db.is_message_posted(message_id, channel["channel_id"]):
+                        task = self.forward_single_message(
+                            context.bot,
+                            source_chat_id,
+                            message_id,
+                            channel["channel_id"]
+                        )
+                        tasks.append(task)
+            
+            # Execute all forwarding tasks concurrently
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
+                success_count = sum(1 for r in results if r is True)
+                failed_count = sum(1 for r in results if isinstance(r, Exception))
+                
+                logger.info(f"Batch completed: {success_count} successful, {failed_count} failed")
+            
+            # Remove processed messages from queue
+            self.forwarding_queue = self.forwarding_queue[self.batch_size:]
+            
+        except Exception as e:
+            logger.error(f"Error in forward_messages_batch: {e}")
+        finally:
+            self.is_processing = False
+            
+            # If there are more messages in queue, schedule next batch
+            if self.forwarding_queue:
+                await asyncio.sleep(1)  # Short delay before next batch
+                context.application.create_task(self.forward_messages_batch(context))
+    
+    async def forward_single_message(self, bot: Bot, source_chat_id: int, message_id: int, target_channel_id: str):
+        """Forward a single message to a channel."""
+        try:
+            await bot.forward_message(
+                chat_id=target_channel_id,
+                from_chat_id=source_chat_id,
+                message_id=message_id
+            )
+            
+            db.mark_message_posted(message_id, target_channel_id)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to forward message {message_id} to {target_channel_id}: {e}")
+            return e
+    
     async def forward_from_main_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Forward messages from main channel to post channels."""
+        """Queue messages from main channel for batch forwarding."""
         main_channel = db.get_main_channel()
         
         if not main_channel:
@@ -398,34 +471,68 @@ class ChannelBot:
         if not post_channels:
             return
         
-        success_count = 0
-        failed_channels = []
+        # Add message to forwarding queue
+        self.forwarding_queue.append({
+            'message_id': message.message_id,
+            'source_chat_id': message.chat.id,
+            'timestamp': datetime.utcnow()
+        })
         
-        for channel in post_channels:
-            try:
-                if db.is_message_posted(message.message_id, channel["channel_id"]):
-                    continue
-                
-                await context.bot.forward_message(
-                    chat_id=channel["channel_id"],
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id
-                )
-                
-                db.mark_message_posted(message.message_id, channel["channel_id"])
-                success_count += 1
-                
-                await asyncio.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"Failed to forward to {channel['channel_id']}: {e}")
-                failed_channels.append(channel.get('title', channel['channel_id']))
+        logger.info(f"Message {message.message_id} added to queue. Queue size: {len(self.forwarding_queue)}")
         
-        if success_count > 0:
-            logger.info(f"Forwarded message {message.message_id} to {success_count} channels")
+        # If queue reaches batch size or this is the first message in queue, start processing
+        if len(self.forwarding_queue) >= self.batch_size or len(self.forwarding_queue) == 1:
+            if not self.is_processing:
+                context.application.create_task(self.forward_messages_batch(context))
+    
+    async def flush_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Manually flush the forwarding queue (admin command)."""
+        user_id = update.effective_user.id
         
-        if failed_channels:
-            logger.warning(f"Failed to forward to: {failed_channels}")
+        if user_id not in Config.ADMIN_IDS:
+            await update.message.reply_text("❌ You are not authorized to use this command.")
+            return
+        
+        queue_size = len(self.forwarding_queue)
+        
+        if queue_size == 0:
+            await update.message.reply_text("📭 Forwarding queue is empty.")
+            return
+        
+        await update.message.reply_text(f"⏳ Flushing {queue_size} messages from queue...")
+        
+        # Trigger batch processing
+        if not self.is_processing:
+            context.application.create_task(self.forward_messages_batch(context))
+            await update.message.reply_text(f"✅ Started processing {queue_size} messages.")
+        else:
+            await update.message.reply_text(f"⏳ Already processing messages. {queue_size} in queue.")
+    
+    async def queue_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show forwarding queue status (admin command)."""
+        user_id = update.effective_user.id
+        
+        if user_id not in Config.ADMIN_IDS:
+            await update.message.reply_text("❌ You are not authorized to use this command.")
+            return
+        
+        status_text = "📊 **Forwarding Queue Status**\n\n"
+        status_text += f"• **Queue Size:** {len(self.forwarding_queue)} messages\n"
+        status_text += f"• **Batch Size:** {self.batch_size} messages\n"
+        status_text += f"• **Currently Processing:** {'Yes' if self.is_processing else 'No'}\n"
+        status_text += f"• **Post Channels:** {len(db.get_post_channels())}\n"
+        
+        if self.forwarding_queue:
+            oldest = self.forwarding_queue[0]['timestamp']
+            newest = self.forwarding_queue[-1]['timestamp']
+            status_text += f"• **Oldest Message:** {oldest.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            status_text += f"• **Newest Message:** {newest.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        
+        status_text += "\n**Commands:**\n"
+        status_text += "• `/flush` - Process all queued messages immediately\n"
+        status_text += "• `/queue` - Show this status\n"
+        
+        await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
     
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show bot statistics."""
@@ -441,10 +548,13 @@ class ChannelBot:
         stats_text = "📈 **Bot Statistics**\n\n"
         stats_text += f"• **Main Channel:** {1 if main_channel else 0}\n"
         stats_text += f"• **Post Channels:** {len(post_channels)}\n"
-        stats_text += f"• **Total Channels:** {1 + len(post_channels)}\n"
+        stats_text += f"• **Forwarding Queue:** {len(self.forwarding_queue)} messages\n"
+        stats_text += f"• **Batch Size:** {self.batch_size} messages\n"
         
         posted_count = db.posted_messages.count_documents({})
-        stats_text += f"• **Messages Forwarded:** {posted_count}\n"
+        stats_text += f"• **Total Messages Forwarded:** {posted_count}\n"
+        
+        stats_text += f"• **Currently Processing:** {'Yes' if self.is_processing else 'No'}\n"
         
         await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
     
@@ -465,6 +575,8 @@ class ChannelBot:
         self.application.add_handler(CommandHandler("list", self.list_channels))
         self.application.add_handler(CommandHandler("remove", self.remove_channel))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
+        self.application.add_handler(CommandHandler("queue", self.queue_status))
+        self.application.add_handler(CommandHandler("flush", self.flush_queue))
         
         # Join request handler
         self.application.add_handler(ChatJoinRequestHandler(self.handle_join_request))
@@ -483,11 +595,19 @@ class ChannelBot:
                 first=10
             )
         
+        # Schedule queue processing job (every 5 minutes for any remaining messages)
+        if job_queue:
+            job_queue.run_repeating(
+                lambda ctx: self.forward_messages_batch(ctx) if self.forwarding_queue and not self.is_processing else None,
+                interval=300,
+                first=60
+            )
+        
         # Error handler
         self.application.add_error_handler(self.error_handler)
         
         # Start the Bot
-        logger.info("Starting bot...")
+        logger.info("Starting bot with batch forwarding...")
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
