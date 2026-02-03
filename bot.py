@@ -1,5 +1,5 @@
 import logging
-from telegram import Update, Bot, ChatMemberAdministrator, ChatJoinRequest
+from telegram import Update, Bot, ChatMemberAdministrator, ChatJoinRequest, Message
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,6 +11,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import asyncio
 from datetime import datetime
+from typing import Dict, List
 from config import Config
 from database import db
 
@@ -24,8 +25,8 @@ logger = logging.getLogger(__name__)
 class ChannelBot:
     def __init__(self):
         self.application = None
-        # Track media groups to forward them together
-        self.media_groups = {}
+        # Store media groups temporarily
+        self.media_groups: Dict[str, List[Message]] = {}
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help message."""
@@ -41,10 +42,15 @@ class ChannelBot:
 • `/stats` - Show bot statistics
 
 **Features:**
-• Instant forwarding (no batching delay)
-• Media group support (albums forwarded as albums)
-• Automatic join request approval
-• MongoDB database for tracking
+• Forwards single messages and media groups (albums) from main channel
+• Handles photos, videos, documents with captions
+• Approves join requests in bulk
+• Auto-forwarding with duplicate prevention
+
+**How to get Channel ID:**
+1. Add bot to your channel as admin
+2. Forward a message from channel to @username_to_id_bot
+3. Or use: /getid in the channel
 
 **Required Bot Permissions:**
 - In Main Channel: Post messages permission
@@ -138,13 +144,219 @@ class ChannelBot:
                 f"✅ Main Channel Set Successfully!\n"
                 f"**Channel:** {chat.title}\n"
                 f"**ID:** `{channel_id}`\n\n"
-                "All posts from this channel will be instantly forwarded to post channels.",
+                "All posts (including media groups) from this channel will be forwarded to post channels.",
                 parse_mode=ParseMode.MARKDOWN
             )
             
         except Exception as e:
             logger.error(f"Error setting main channel: {e}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
+    
+    async def forward_media_group(self, context: ContextTypes.DEFAULT_TYPE, media_group_id: str, post_channels: List[dict]):
+        """Forward a media group (album) to all post channels."""
+        if media_group_id not in self.media_groups:
+            return
+        
+        messages = self.media_groups[media_group_id]
+        if not messages:
+            return
+        
+        # Sort messages by message_id to maintain order
+        messages.sort(key=lambda x: x.message_id)
+        
+        # Get caption from the first message with caption
+        caption = None
+        caption_message = None
+        for msg in messages:
+            if msg.caption or msg.caption_entities:
+                caption = msg.caption
+                caption_message = msg
+                break
+        
+        success_count = 0
+        failed_channels = []
+        
+        for channel in post_channels:
+            try:
+                # Check if any message from this media group is already forwarded
+                already_posted = False
+                for msg in messages:
+                    if db.is_message_posted(msg.message_id, channel["channel_id"]):
+                        already_posted = True
+                        break
+                
+                if already_posted:
+                    continue
+                
+                # Prepare media for sending as album
+                media_list = []
+                for msg in messages:
+                    media_type = None
+                    media_file_id = None
+                    
+                    if msg.photo:
+                        media_type = "photo"
+                        media_file_id = msg.photo[-1].file_id  # Get highest resolution
+                    elif msg.video:
+                        media_type = "video"
+                        media_file_id = msg.video.file_id
+                    elif msg.document:
+                        media_type = "document"
+                        media_file_id = msg.document.file_id
+                    elif msg.audio:
+                        media_type = "audio"
+                        media_file_id = msg.audio.file_id
+                    
+                    if media_type and media_file_id:
+                        media_dict = {
+                            "type": media_type,
+                            "media": media_file_id
+                        }
+                        
+                        # Add caption only to the first media if caption exists
+                        if caption and msg.message_id == caption_message.message_id:
+                            media_dict["caption"] = caption
+                            if caption_message.caption_entities:
+                                media_dict["caption_entities"] = caption_message.caption_entities
+                        
+                        media_list.append(media_dict)
+                
+                if len(media_list) == 1:
+                    # Send single media if only one in group
+                    media = media_list[0]
+                    if media["type"] == "photo":
+                        await context.bot.send_photo(
+                            chat_id=channel["channel_id"],
+                            photo=media["media"],
+                            caption=media.get("caption"),
+                            caption_entities=media.get("caption_entities")
+                        )
+                    elif media["type"] == "video":
+                        await context.bot.send_video(
+                            chat_id=channel["channel_id"],
+                            video=media["media"],
+                            caption=media.get("caption"),
+                            caption_entities=media.get("caption_entities")
+                        )
+                    elif media["type"] == "document":
+                        await context.bot.send_document(
+                            chat_id=channel["channel_id"],
+                            document=media["media"],
+                            caption=media.get("caption"),
+                            caption_entities=media.get("caption_entities")
+                        )
+                    elif media["type"] == "audio":
+                        await context.bot.send_audio(
+                            chat_id=channel["channel_id"],
+                            audio=media["media"],
+                            caption=media.get("caption"),
+                            caption_entities=media.get("caption_entities")
+                        )
+                elif len(media_list) > 1:
+                    # Send as media group
+                    await context.bot.send_media_group(
+                        chat_id=channel["channel_id"],
+                        media=media_list
+                    )
+                
+                # Mark all messages as posted
+                for msg in messages:
+                    db.mark_message_posted(msg.message_id, channel["channel_id"])
+                
+                success_count += 1
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Failed to forward media group to {channel['channel_id']}: {e}")
+                failed_channels.append(channel.get('title', channel['channel_id']))
+        
+        # Clean up stored media group
+        del self.media_groups[media_group_id]
+        
+        if success_count > 0:
+            logger.info(f"Forwarded media group {media_group_id} ({len(messages)} items) to {success_count} channels")
+        
+        if failed_channels:
+            logger.warning(f"Failed to forward media group to: {failed_channels}")
+    
+    async def forward_single_message(self, context: ContextTypes.DEFAULT_TYPE, message: Message, post_channels: List[dict]):
+        """Forward a single message to all post channels."""
+        success_count = 0
+        failed_channels = []
+        
+        for channel in post_channels:
+            try:
+                if db.is_message_posted(message.message_id, channel["channel_id"]):
+                    continue
+                
+                await context.bot.forward_message(
+                    chat_id=channel["channel_id"],
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id
+                )
+                
+                db.mark_message_posted(message.message_id, channel["channel_id"])
+                success_count += 1
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Failed to forward to {channel['channel_id']}: {e}")
+                failed_channels.append(channel.get('title', channel['channel_id']))
+        
+        if success_count > 0:
+            logger.info(f"Forwarded single message {message.message_id} to {success_count} channels")
+        
+        if failed_channels:
+            logger.warning(f"Failed to forward to: {failed_channels}")
+    
+    async def forward_from_main_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Forward messages from main channel to post channels."""
+        main_channel = db.get_main_channel()
+        
+        if not main_channel:
+            return
+        
+        if str(update.channel_post.chat.id) != main_channel["channel_id"]:
+            return
+        
+        message = update.channel_post
+        post_channels = db.get_post_channels()
+        
+        if not post_channels:
+            return
+        
+        # Check if message is part of a media group
+        if message.media_group_id:
+            # Store message in media group collection
+            media_group_id = message.media_group_id
+            
+            if media_group_id not in self.media_groups:
+                self.media_groups[media_group_id] = []
+            
+            self.media_groups[media_group_id].append(message)
+            
+            # Wait a bit to collect all media group messages
+            # Telegram sends them one by one quickly
+            await asyncio.sleep(1.5)
+            
+            # Check if we have all messages (give it some time)
+            # We'll forward after a delay to ensure we have all parts
+            if media_group_id in self.media_groups:
+                # Schedule forwarding after 2 seconds to collect all media
+                context.application.create_task(
+                    self.delayed_media_group_forward(context, media_group_id, post_channels)
+                )
+        else:
+            # Single message, forward immediately
+            await self.forward_single_message(context, message, post_channels)
+    
+    async def delayed_media_group_forward(self, context: ContextTypes.DEFAULT_TYPE, media_group_id: str, post_channels: List[dict]):
+        """Forward media group after a delay to collect all parts."""
+        # Wait additional time to ensure all media group messages are collected
+        await asyncio.sleep(1.0)
+        
+        # Forward the media group
+        await self.forward_media_group(context, media_group_id, post_channels)
     
     async def get_all_pending_requests(self, bot: Bot, channel_id: str):
         """Get all pending join requests for a channel."""
@@ -376,191 +588,6 @@ class ChannelBot:
             parse_mode=ParseMode.MARKDOWN
         )
     
-    async def forward_single_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Forward a single message (non-media group)."""
-        main_channel = db.get_main_channel()
-        
-        if not main_channel:
-            return
-        
-        if str(update.channel_post.chat.id) != main_channel["channel_id"]:
-            return
-        
-        message = update.channel_post
-        post_channels = db.get_post_channels()
-        
-        if not post_channels:
-            return
-        
-        # Check if this is part of a media group
-        if message.media_group_id:
-            # Handle as part of media group
-            await self.handle_media_group(message, context)
-            return
-        
-        # Regular single message - forward immediately
-        success_count = 0
-        failed_channels = []
-        
-        for channel in post_channels:
-            try:
-                if db.is_message_posted(message.message_id, channel["channel_id"]):
-                    continue
-                
-                await context.bot.forward_message(
-                    chat_id=channel["channel_id"],
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id
-                )
-                
-                db.mark_message_posted(message.message_id, channel["channel_id"])
-                success_count += 1
-                
-                # Small delay to avoid rate limits
-                await asyncio.sleep(0.1)
-                
-            except Exception as e:
-                logger.error(f"Failed to forward message {message.message_id} to {channel['channel_id']}: {e}")
-                failed_channels.append(channel.get('title', channel['channel_id']))
-        
-        if success_count > 0:
-            logger.info(f"Forwarded single message {message.message_id} to {success_count} channels")
-        
-        if failed_channels:
-            logger.warning(f"Failed to forward to: {failed_channels}")
-    
-    async def handle_media_group(self, message, context: ContextTypes.DEFAULT_TYPE):
-        """Handle media groups (albums)."""
-        media_group_id = message.media_group_id
-        
-        # Initialize or update media group collection
-        if media_group_id not in self.media_groups:
-            self.media_groups[media_group_id] = {
-                'messages': [],
-                'last_update': datetime.utcnow(),
-                'processing': False
-            }
-        
-        # Add message to media group
-        self.media_groups[media_group_id]['messages'].append({
-            'message_id': message.message_id,
-            'chat_id': message.chat.id,
-            'timestamp': datetime.utcnow()
-        })
-        self.media_groups[media_group_id]['last_update'] = datetime.utcnow()
-        
-        logger.info(f"Added message {message.message_id} to media group {media_group_id}. Total: {len(self.media_groups[media_group_id]['messages'])}")
-        
-        # Wait for 1 second to collect all messages in the media group
-        # Telegram sends media group messages rapidly but not instantly
-        await asyncio.sleep(1)
-        
-        # Check if we should process this media group
-        if (not self.media_groups[media_group_id]['processing'] and 
-            datetime.utcnow() - self.media_groups[media_group_id]['last_update']).seconds >= 1:
-            
-            self.media_groups[media_group_id]['processing'] = True
-            await self.process_media_group(media_group_id, context)
-    
-    async def process_media_group(self, media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
-        """Process a complete media group."""
-        try:
-            media_group = self.media_groups.get(media_group_id)
-            if not media_group or not media_group['messages']:
-                return
-            
-            messages = media_group['messages']
-            post_channels = db.get_post_channels()
-            
-            if not post_channels:
-                # Clean up
-                if media_group_id in self.media_groups:
-                    del self.media_groups[media_group_id]
-                return
-            
-            logger.info(f"Processing media group {media_group_id} with {len(messages)} messages")
-            
-            # Forward to each post channel
-            for channel in post_channels:
-                try:
-                    # Get message IDs that haven't been forwarded yet
-                    message_ids_to_forward = []
-                    for msg in messages:
-                        if not db.is_message_posted(msg['message_id'], channel["channel_id"]):
-                            message_ids_to_forward.append(msg['message_id'])
-                    
-                    if not message_ids_to_forward:
-                        continue
-                    
-                    # Forward first message
-                    first_msg = messages[0]
-                    await context.bot.forward_message(
-                        chat_id=channel["channel_id"],
-                        from_chat_id=first_msg['chat_id'],
-                        message_id=first_msg['message_id']
-                    )
-                    
-                    # Mark first message as posted
-                    db.mark_message_posted(first_msg['message_id'], channel["channel_id"])
-                    
-                    # Forward remaining messages as a group
-                    if len(messages) > 1:
-                        for msg in messages[1:]:
-                            try:
-                                await context.bot.forward_message(
-                                    chat_id=channel["channel_id"],
-                                    from_chat_id=msg['chat_id'],
-                                    message_id=msg['message_id']
-                                )
-                                db.mark_message_posted(msg['message_id'], channel["channel_id"])
-                                await asyncio.sleep(0.1)  # Small delay
-                            except Exception as e:
-                                logger.error(f"Failed to forward media group message {msg['message_id']}: {e}")
-                    
-                    logger.info(f"Forwarded media group {media_group_id} ({len(messages)} messages) to {channel['channel_id']}")
-                    
-                except Exception as e:
-                    logger.error(f"Failed to forward media group {media_group_id} to {channel['channel_id']}: {e}")
-            
-            # Clean up after processing
-            if media_group_id in self.media_groups:
-                del self.media_groups[media_group_id]
-                
-            logger.info(f"Completed processing media group {media_group_id}")
-            
-        except Exception as e:
-            logger.error(f"Error processing media group {media_group_id}: {e}")
-            # Clean up on error
-            if media_group_id in self.media_groups:
-                del self.media_groups[media_group_id]
-    
-    async def forward_from_main_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Main handler for forwarding from main channel."""
-        # This method will handle both single messages and media groups
-        await self.forward_single_message(update, context)
-    
-    async def cleanup_old_media_groups(self, context: ContextTypes.DEFAULT_TYPE):
-        """Clean up old media groups that weren't completed."""
-        try:
-            current_time = datetime.utcnow()
-            groups_to_remove = []
-            
-            for media_group_id, data in self.media_groups.items():
-                # Remove groups older than 30 seconds (should have been processed)
-                if (current_time - data['last_update']).seconds > 30:
-                    groups_to_remove.append(media_group_id)
-                    logger.warning(f"Cleaning up old media group {media_group_id} with {len(data['messages'])} messages")
-            
-            for media_group_id in groups_to_remove:
-                # Try to process whatever we have
-                if self.media_groups[media_group_id]['messages']:
-                    await self.process_media_group(media_group_id, context)
-                else:
-                    del self.media_groups[media_group_id]
-                    
-        except Exception as e:
-            logger.error(f"Error in cleanup_old_media_groups: {e}")
-    
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show bot statistics."""
         user_id = update.effective_user.id
@@ -575,18 +602,12 @@ class ChannelBot:
         stats_text = "📈 **Bot Statistics**\n\n"
         stats_text += f"• **Main Channel:** {1 if main_channel else 0}\n"
         stats_text += f"• **Post Channels:** {len(post_channels)}\n"
-        stats_text += f"• **Active Media Groups:** {len(self.media_groups)}\n"
+        stats_text += f"• **Total Channels:** {1 + len(post_channels)}\n"
         
         posted_count = db.posted_messages.count_documents({})
-        stats_text += f"• **Total Messages Forwarded:** {posted_count}\n"
+        stats_text += f"• **Messages Forwarded:** {posted_count}\n"
         
-        # Show media group info
-        if self.media_groups:
-            stats_text += f"\n**Active Media Groups:**\n"
-            for mg_id, data in list(self.media_groups.items())[:5]:  # Show first 5
-                stats_text += f"• {mg_id[:8]}...: {len(data['messages'])} messages\n"
-            if len(self.media_groups) > 5:
-                stats_text += f"• ... and {len(self.media_groups) - 5} more\n"
+        stats_text += f"• **Media Groups in Memory:** {len(self.media_groups)}\n"
         
         await update.message.reply_text(stats_text, parse_mode=ParseMode.MARKDOWN)
     
@@ -616,28 +637,20 @@ class ChannelBot:
             MessageHandler(filters.ChatType.CHANNEL, self.forward_from_main_channel)
         )
         
-        # Schedule jobs
+        # Schedule auto-approval job (every 24 hours)
         job_queue = self.application.job_queue
         if job_queue:
-            # Auto-approval job (every 24 hours)
             job_queue.run_repeating(
                 self.auto_approve_old_requests,
                 interval=86400,
                 first=10
-            )
-            
-            # Media group cleanup job (every 5 minutes)
-            job_queue.run_repeating(
-                self.cleanup_old_media_groups,
-                interval=300,
-                first=60
             )
         
         # Error handler
         self.application.add_error_handler(self.error_handler)
         
         # Start the Bot
-        logger.info("Starting bot with media group support...")
+        logger.info("Starting bot...")
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 def main():
