@@ -1,4 +1,3 @@
-
 import logging
 from telegram import Update, Bot, ChatMemberAdministrator, ChatJoinRequest
 from telegram.ext import (
@@ -481,9 +480,6 @@ class ChannelBot:
         self.application.add_handler(CommandHandler("list", self.list_channels))
         self.application.add_handler(CommandHandler("remove", self.remove_channel))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
-        
-
-        
         
         # Join request handler
         self.application.add_handler(ChatJoinRequestHandler(self.handle_join_request))
