@@ -482,6 +482,9 @@ class ChannelBot:
         self.application.add_handler(CommandHandler("remove", self.remove_channel))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
         
+
+        
+        
         # Join request handler
         self.application.add_handler(ChatJoinRequestHandler(self.handle_join_request))
         
@@ -497,4 +500,19 @@ class ChannelBot:
                 self.auto_approve_old_requests,
                 interval=86400,
                 first=10
+            )
         
+        # Error handler
+        self.application.add_error_handler(self.error_handler)
+        
+        # Start the Bot
+        logger.info("Starting bot...")
+        self.application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main():
+    """Main function to run the bot."""
+    bot = ChannelBot()
+    bot.run()
+
+if __name__ == '__main__':
+    main()
