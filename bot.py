@@ -8,9 +8,9 @@ from telegram.ext import (
     filters,
     ChatJoinRequestHandler
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import Config
 from database import db
 
@@ -25,20 +25,7 @@ class ChannelBot:
     def __init__(self):
         self.application = None
     
-    # Remove start method since you don't want it
-    # async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    #     """Send a welcome message when /start is issued."""
-    #     user = update.effective_user
-    #     await update.message.reply_text(
-    #         f"Hi {user.first_name}! I'm your Channel Management Bot.\n\n"
-    #         "Available commands:\n"
-    #         "/add <channel_id> - Add a channel as post channel\n"
-    #         "/main <channel_id> - Set main channel\n"
-    #         "/approve <channel_id> - Approve all pending join requests\n"
-    #         "/list - List all channels\n"
-    #         "/remove <channel_id> - Remove a channel\n"
-    #         "/help - Show help message"
-    #     )
+   
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help message."""
@@ -170,13 +157,15 @@ class ChannelBot:
     async def get_all_pending_requests(self, bot: Bot, channel_id: str):
         """Get all pending join requests for a channel."""
         try:
+            # Get join requests using pagination
             all_requests = []
             offset = None
             
             while True:
+                # Get batch of join requests
                 result = await bot.get_chat_join_requests(
                     chat_id=channel_id,
-                    limit=100,
+                    limit=100,  # Maximum per request
                     offset=offset
                 )
                 
@@ -185,6 +174,7 @@ class ChannelBot:
                 
                 all_requests.extend(result.join_requests)
                 
+                # Check if there are more requests
                 if not result.next_offset:
                     break
                 
@@ -225,8 +215,10 @@ class ChannelBot:
         try:
             bot = context.bot
             
+            # Send initial status
             status_msg = await update.message.reply_text("⏳ Fetching pending join requests...")
             
+            # Check if bot is admin in the channel
             chat = await bot.get_chat(channel_id)
             bot_member = await chat.get_member(bot.id)
             
@@ -244,6 +236,7 @@ class ChannelBot:
                 )
                 return
             
+            # Get all pending requests
             await status_msg.edit_text("📋 Fetching all pending join requests...")
             pending_requests = await self.get_all_pending_requests(bot, channel_id)
             
@@ -254,40 +247,55 @@ class ChannelBot:
                 )
                 return
             
+            # Start approving
             total_requests = len(pending_requests)
             await status_msg.edit_text(f"✅ Found {total_requests} pending requests\n⏳ Approving now...")
             
             approved_count = 0
             failed_count = 0
+            failed_users = []
             
+            # Approve each request with delay to avoid rate limits
             for i, join_request in enumerate(pending_requests, 1):
                 user = join_request.user
                 
+                # Update progress every 10 requests
                 if i % 10 == 0:
                     progress = f"Processing {i}/{total_requests}\nApproved: {approved_count}"
                     await status_msg.edit_text(f"⏳ {progress}")
                 
+                # Approve the request
                 success = await self.approve_join_request(bot, channel_id, user.id)
                 
                 if success:
                     approved_count += 1
                 else:
                     failed_count += 1
+                    failed_users.append(user.username or user.id)
                 
+                # Delay to avoid hitting rate limits (0.5 seconds between requests)
                 await asyncio.sleep(0.5)
             
+            # Prepare final report
             report = f"📊 **Approval Report for {chat.title}**\n\n"
             report += f"✅ **Successfully Approved:** {approved_count}/{total_requests}\n"
             
             if failed_count > 0:
                 report += f"❌ **Failed:** {failed_count}\n"
+                if len(failed_users) <= 5:  # Show only first 5 failed users
+                    report += f"Failed users: {', '.join(map(str, failed_users[:5]))}"
+                    if len(failed_users) > 5:
+                        report += f" and {len(failed_users)-5} more..."
             
+            # Check if there are still pending requests
             remaining_requests = await self.get_all_pending_requests(bot, channel_id)
             if remaining_requests:
                 report += f"\n\n⚠️ **Note:** {len(remaining_requests)} requests still pending.\n"
                 report += "Some requests might have been made after we started processing."
             
             await status_msg.edit_text(report, parse_mode=ParseMode.MARKDOWN)
+            
+            # Log the action
             logger.info(f"Approved {approved_count} join requests in channel {channel_id}")
             
         except Exception as e:
@@ -304,25 +312,41 @@ class ChannelBot:
                 pass
     
     async def handle_join_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle new join requests."""
+        """Handle new join requests automatically (optional)."""
         join_request = update.chat_join_request
+        
+        # You can implement automatic approval here if needed
+        # For example, auto-approve after certain conditions
+        # await context.bot.approve_chat_join_request(
+        #     chat_id=join_request.chat.id,
+        #     user_id=join_request.from_user.id
+        # )
+        
+        # Or log the request
         logger.info(f"New join request from {join_request.from_user.id} in channel {join_request.chat.id}")
     
     async def auto_approve_old_requests(self, context: ContextTypes.DEFAULT_TYPE):
-        """Auto-approve requests (scheduled job)."""
+        """Auto-approve requests older than X days (scheduled job)."""
         try:
+            # Get all post channels
             post_channels = db.get_post_channels()
             
             for channel in post_channels:
                 channel_id = channel["channel_id"]
                 
                 try:
+                    # Get pending requests
                     bot = context.bot
                     pending_requests = await self.get_all_pending_requests(bot, channel_id)
                     
                     if not pending_requests:
                         continue
                     
+                    # Check request date (if available in request object)
+                    # Note: Telegram API doesn't provide request timestamp directly
+                    # You might need to store requests in DB when they come in
+                    
+                    # For now, we'll approve all pending requests
                     approved_count = 0
                     for join_request in pending_requests:
                         success = await self.approve_join_request(bot, channel_id, join_request.user.id)
@@ -399,6 +423,7 @@ class ChannelBot:
     
     async def forward_from_main_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Forward messages from main channel to post channels."""
+        # Only process if message is from main channel
         main_channel = db.get_main_channel()
         
         if not main_channel:
@@ -413,29 +438,35 @@ class ChannelBot:
         if not post_channels:
             return
         
+        # Forward to all post channels
         success_count = 0
         failed_channels = []
         
         for channel in post_channels:
             try:
+                # Check if message already forwarded to this channel
                 if db.is_message_posted(message.message_id, channel["channel_id"]):
                     continue
                 
+                # Forward the message
                 await context.bot.forward_message(
                     chat_id=channel["channel_id"],
                     from_chat_id=message.chat.id,
                     message_id=message.message_id
                 )
                 
+                # Mark as posted
                 db.mark_message_posted(message.message_id, channel["channel_id"])
                 success_count += 1
                 
+                # Small delay to avoid rate limits
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
                 logger.error(f"Failed to forward to {channel['channel_id']}: {e}")
                 failed_channels.append(channel.get('title', channel['channel_id']))
         
+        # Log the result
         if success_count > 0:
             logger.info(f"Forwarded message {message.message_id} to {success_count} channels")
         
@@ -458,6 +489,7 @@ class ChannelBot:
         stats_text += f"• **Post Channels:** {len(post_channels)}\n"
         stats_text += f"• **Total Channels:** {1 + len(post_channels)}\n"
         
+        # Get posted messages count
         posted_count = db.posted_messages.count_documents({})
         stats_text += f"• **Messages Forwarded:** {posted_count}\n"
         
@@ -472,7 +504,8 @@ class ChannelBot:
         # Create Application
         self.application = Application.builder().token(Config.BOT_TOKEN).build()
         
-        # Command handlers - REMOVED /start
+        # Command handlers
+        self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("add", self.add_channel))
         self.application.add_handler(CommandHandler("main", self.set_main_channel))
@@ -481,7 +514,7 @@ class ChannelBot:
         self.application.add_handler(CommandHandler("remove", self.remove_channel))
         self.application.add_handler(CommandHandler("stats", self.stats_command))
         
-        # Join request handler
+        # Join request handler (for auto-approval if needed)
         self.application.add_handler(ChatJoinRequestHandler(self.handle_join_request))
         
         # Message handlers - for forwarding from main channel
@@ -494,7 +527,7 @@ class ChannelBot:
         if job_queue:
             job_queue.run_repeating(
                 self.auto_approve_old_requests,
-                interval=86400,
+                interval=86400,  # 24 hours in seconds
                 first=10
             )
         
@@ -505,10 +538,6 @@ class ChannelBot:
         logger.info("Starting bot...")
         self.application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-def main():
-    """Main function to run the bot."""
+if __name__ == '__main__':
     bot = ChannelBot()
     bot.run()
-
-if __name__ == '__main__':
-    main()
