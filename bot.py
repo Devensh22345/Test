@@ -25,19 +25,7 @@ class ChannelBot:
     def __init__(self):
         self.application = None
     
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Send a welcome message when /start is issued."""
-        user = update.effective_user
-        await update.message.reply_text(
-            f"Hi {user.first_name}! I'm your Channel Management Bot.\n\n"
-            "Available commands:\n"
-            "/add <channel_id> - Add a channel as post channel\n"
-            "/main <channel_id> - Set main channel\n"
-            "/approve <channel_id> - Approve all pending join requests\n"
-            "/list - List all channels\n"
-            "/remove <channel_id> - Remove a channel\n"
-            "/help - Show help message"
-        )
+   
     
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send help message."""
